@@ -7,11 +7,15 @@ import {
   type AuthorizationCodeRequest,
   type AuthorizationCodePayload,
   InteractionRequiredAuthError,
+  ICachePlugin,
+  TokenCacheContext,
 } from "@azure/msal-node";
+import fs from "fs";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { NextRequest, NextResponse } from "next/server";
 import { createSession, verifySession } from "./lib/session";
+import path from "node:path";
 
 export const CLIENT_ID = process.env.CLIENT_ID;
 export const CLIENT_SECRET = process.env.CLIENT_SECRET;
@@ -43,21 +47,47 @@ if (!CLIENT_ID) {
   throw new Error("CLIENT_ID is undefined");
 }
 
+const cachePath = path.join("./token-cache.json");
+
+class DiskCachePlugin implements ICachePlugin {
+  public async beforeCacheAccess(
+    cacheContext: TokenCacheContext,
+  ): Promise<void> {
+    if (fs.existsSync(cachePath)) {
+      const cacheData = fs.readFileSync(cachePath, "utf8");
+      cacheContext.tokenCache.deserialize(cacheData); // deserialize it to in-memory cache
+    }
+  }
+
+  public async afterCacheAccess(
+    cacheContext: TokenCacheContext,
+  ): Promise<void> {
+    if (cacheContext.cacheHasChanged) {
+      fs.writeFileSync(cachePath, cacheContext.tokenCache.serialize()); // deserialize in-memory cache to persistence
+    }
+  }
+}
+
 const msalConfig: Configuration = {
   auth: {
     clientId: CLIENT_ID, // 'Application (client) ID' of app registration in Azure portal - this value is a GUID
     authority: CLOUD_INSTANCE + TENANT_ID, // Full directory URL, in the form of https://login.microsoftonline.com/<tenant>
     clientSecret: CLIENT_SECRET, // Client secret generated from the app registration in Azure portal
   },
+  cache: {
+    cachePlugin: new DiskCachePlugin(),
+  },
 };
 
 class AuthProvider {
   msalConfig: Configuration;
   cryptoProvider: CryptoProvider;
+  cca: ConfidentialClientApplication;
 
   constructor(msalConfig: Configuration) {
     this.msalConfig = msalConfig;
     this.cryptoProvider = new CryptoProvider();
+    this.cca = new ConfidentialClientApplication(msalConfig);
   }
 
   async login(options: {
@@ -110,7 +140,7 @@ class AuthProvider {
         JSON.stringify(authorityMetadata);
     }
 
-    const msalInstance = this.getMsalInstance(this.msalConfig);
+    const msalInstance = this.cca;
 
     // trigger the first leg of auth code flow
     await this.redirectToAuthCodeUrl(authCodeUrlRequestParams, msalInstance);
@@ -130,16 +160,11 @@ class AuthProvider {
        * cache for the new MSAL CCA instance. For more, see:
        * https://github.com/AzureAD/microsoft-authentication-library-for-js/blob/dev/lib/msal-node/docs/caching.md
        */
-      // if (req.session.tokenCache) {
-      //   msalInstance.getTokenCache().deserialize(req.session.tokenCache);
-      // }
-      const msalInstance = this.getMsalInstance(this.msalConfig);
-      const { tokenCache, homeAccountId } = session;
-      // if (tokenCache) {
-      //   msalInstance.getTokenCache().deserialize(tokenCache);
-      // }
+      const msalInstance = this.cca;
+      const homeAccountId = session.homeAccountId;
 
       const msalTokenCache = msalInstance.getTokenCache();
+      console.log("cache", msalTokenCache);
       const account = await msalTokenCache.getAccountByHomeId(homeAccountId);
 
       if (account === null) {
@@ -156,35 +181,20 @@ class AuthProvider {
        * cache back to the session. For more, see:
        * https://github.com/AzureAD/microsoft-authentication-library-for-js/blob/dev/lib/msal-node/docs/caching.md
        */
-      // cookieStore.set("tokenCache", msalInstance.getTokenCache().serialize());
-      // cookieStore.set("accessToken", tokenResponse.accessToken);
-      // cookieStore.set("idToken", tokenResponse.idToken);
-      // cookieStore.set("account", tokenResponse.account);
 
-      await createSession({
-        tokenCache: msalInstance.getTokenCache().serialize(),
-        idToken: tokenResponse.idToken,
-        homeAccountId: tokenResponse.account?.homeAccountId ?? "",
-        accessToken: tokenResponse.accessToken,
-      });
-
-      // req.session.tokenCache = msalInstance.getTokenCache().serialize();
-      // req.session.accessToken = tokenResponse.accessToken;
-      // req.session.idToken = tokenResponse.idToken;
-      // req.session.account = tokenResponse.account;
-
-      return redirect(options.successRedirect);
+      if (tokenResponse.account?.homeAccountId)
+        await createSession(tokenResponse.account?.homeAccountId);
     } catch (error) {
       if (error instanceof InteractionRequiredAuthError) {
-        return this.login({
+        await this.login({
           scopes: options.scopes || [],
           redirectUri: options.redirectUri,
           successRedirect: options.successRedirect || "/",
         });
       }
       console.error(error);
-      // NextResponse.next(error);
     }
+    redirect(options.successRedirect);
   }
 
   async handleRedirect(
@@ -229,7 +239,7 @@ class AuthProvider {
 
     let state;
     try {
-      const msalInstance = this.getMsalInstance(this.msalConfig);
+      const msalInstance = this.cca;
 
       const cachedState = cookieStore.get("state")?.value;
       const authCodePayload: AuthorizationCodePayload = {
@@ -242,18 +252,9 @@ class AuthProvider {
         authCodePayload,
       );
 
-      // req.session.tokenCache = msalInstance.getTokenCache().serialize();
-      // req.session.idToken = tokenResponse.idToken;
-      // req.session.account = tokenResponse.account;
-      // req.session.isAuthenticated = true;
-      // cookieStore.set("tokenCache", msalInstance.getTokenCache().serialize());
-      // cookieStore.set("idToken", tokenResponse.idToken);
-      // cookieStore.set("account", tokenResponse.account);
-
-      await createSession({
-        idToken: tokenResponse.idToken,
-        homeAccountId: tokenResponse.account?.homeAccountId ?? "",
-      });
+      if (tokenResponse.account?.homeAccountId) {
+        await createSession(tokenResponse.account?.homeAccountId);
+      }
 
       state = JSON.parse(this.cryptoProvider.base64Decode(reqState));
     } catch (error) {
@@ -277,20 +278,9 @@ class AuthProvider {
       logoutUri += `logout?post_logout_redirect_uri=${postLogoutRedirectUri}`;
     }
 
-    cookieStore.delete("tokenCache");
-    cookieStore.delete("idToken");
-    cookieStore.delete("account");
-    cookieStore.delete("verifier");
+    cookieStore.delete("session");
 
     NextResponse.redirect(logoutUri);
-  }
-
-  /**
-   * Instantiates a new MSAL ConfidentialClientApplication object
-   * @param msalConfig: MSAL Node Configuration object
-   */
-  getMsalInstance(msalConfig: Configuration): ConfidentialClientApplication {
-    return new ConfidentialClientApplication(msalConfig);
   }
 
   /**
