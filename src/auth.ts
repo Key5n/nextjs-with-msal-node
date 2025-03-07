@@ -1,0 +1,407 @@
+import {
+  ConfidentialClientApplication,
+  CryptoProvider,
+  ResponseMode,
+  type Configuration,
+  type AuthorizationUrlRequest,
+  type AuthorizationCodeRequest,
+  type AuthorizationCodePayload,
+  InteractionRequiredAuthError,
+} from "@azure/msal-node";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+import { NextRequest, NextResponse } from "next/server";
+import { createSession, verifySession } from "./lib/session";
+
+export const CLIENT_ID = process.env.CLIENT_ID;
+export const CLIENT_SECRET = process.env.CLIENT_SECRET;
+export const TENANT_ID = process.env.TENANT_ID;
+
+const REDIRECT_URI = process.env.REDIRECT_URI;
+const POST_LOGOUT_REDIRECT_URI = process.env.POST_LOGOUT_REDIRECT_URI;
+const GRAPH_ME_ENDPOINT = process.env.GRAPH_API_ENDPOINT + "v1.0/me";
+
+const CLOUD_INSTANCE = process.env.CLOUD_INSTANCE;
+
+if (!CLIENT_ID) {
+  throw new Error("CLIENT_ID is undefined");
+}
+
+if (!TENANT_ID) {
+  throw new Error("TENANT_ID is undefined");
+}
+
+if (!CLIENT_SECRET) {
+  throw new Error("CLIENT_SECRET is undefined");
+}
+
+if (!CLOUD_INSTANCE) {
+  throw new Error("CLOUD_INSTANCE is undefined");
+}
+
+if (!CLIENT_ID) {
+  throw new Error("CLIENT_ID is undefined");
+}
+
+const msalConfig: Configuration = {
+  auth: {
+    clientId: CLIENT_ID, // 'Application (client) ID' of app registration in Azure portal - this value is a GUID
+    authority: CLOUD_INSTANCE + TENANT_ID, // Full directory URL, in the form of https://login.microsoftonline.com/<tenant>
+    clientSecret: CLIENT_SECRET, // Client secret generated from the app registration in Azure portal
+  },
+};
+
+class AuthProvider {
+  msalConfig: Configuration;
+  cryptoProvider: CryptoProvider;
+
+  constructor(msalConfig: Configuration) {
+    this.msalConfig = msalConfig;
+    this.cryptoProvider = new CryptoProvider();
+  }
+
+  async login(options: {
+    successRedirect: string;
+    redirectUri: string;
+    scopes: string[];
+    extraScopesToConsent?: string[];
+  }) {
+    /**
+     * MSAL Node library allows you to pass your custom state as state parameter in the Request object.
+     * The state parameter can also be used to encode information of the app's state before redirect.
+     * You can pass the user's state in the app, such as the page or view they were on, as input to this parameter.
+     */
+    const state = this.cryptoProvider.base64Encode(
+      JSON.stringify({
+        successRedirect: options.successRedirect || "/",
+      }),
+    );
+
+    const authCodeUrlRequestParams: AuthorizationUrlRequest = {
+      state,
+      /**
+       * By default, MSAL Node will add OIDC scopes to the auth code url request. For more information, visit:
+       * https://docs.microsoft.com/azure/active-directory/develop/v2-permissions-and-consent#openid-connect-scopes
+       */
+      scopes: options.scopes,
+      extraScopesToConsent: options.extraScopesToConsent,
+      redirectUri: options.redirectUri,
+    };
+
+    /**
+     * If the current msal configuration does not have cloudDiscoveryMetadata or authorityMetadata, we will
+     * make a request to the relevant endpoints to retrieve the metadata. This allows MSAL to avoid making
+     * metadata discovery calls, thereby improving performance of token acquisition process. For more, see:
+     * https://github.com/AzureAD/microsoft-authentication-library-for-js/blob/dev/lib/msal-node/docs/performance.md
+     */
+    if (
+      !this.msalConfig.auth.cloudDiscoveryMetadata ||
+      !this.msalConfig.auth.authorityMetadata
+    ) {
+      const [cloudDiscoveryMetadata, authorityMetadata] = await Promise.all([
+        this.getCloudDiscoveryMetadata(this.msalConfig.auth.authority),
+        this.getAuthorityMetadata(this.msalConfig.auth.authority),
+      ]);
+
+      this.msalConfig.auth.cloudDiscoveryMetadata = JSON.stringify(
+        cloudDiscoveryMetadata,
+      );
+      this.msalConfig.auth.authorityMetadata =
+        JSON.stringify(authorityMetadata);
+    }
+
+    const msalInstance = this.getMsalInstance(this.msalConfig);
+
+    // trigger the first leg of auth code flow
+    await this.redirectToAuthCodeUrl(authCodeUrlRequestParams, msalInstance);
+  }
+
+  async acquireToken(options: {
+    scopes: string[];
+    successRedirect: string;
+    redirectUri: string;
+  }) {
+    try {
+      const session = await verifySession();
+      if (!session) return null;
+
+      /**
+       * If a token cache exists in the session, deserialize it and set it as the
+       * cache for the new MSAL CCA instance. For more, see:
+       * https://github.com/AzureAD/microsoft-authentication-library-for-js/blob/dev/lib/msal-node/docs/caching.md
+       */
+      // if (req.session.tokenCache) {
+      //   msalInstance.getTokenCache().deserialize(req.session.tokenCache);
+      // }
+      const msalInstance = this.getMsalInstance(this.msalConfig);
+      const { tokenCache, homeAccountId } = session;
+      // if (tokenCache) {
+      //   msalInstance.getTokenCache().deserialize(tokenCache);
+      // }
+
+      const msalTokenCache = msalInstance.getTokenCache();
+      const account = await msalTokenCache.getAccountByHomeId(homeAccountId);
+
+      if (account === null) {
+        throw new Error("Account not found");
+      }
+
+      const tokenResponse = await msalInstance.acquireTokenSilent({
+        account: account,
+        scopes: options.scopes || [],
+      });
+
+      /**
+       * On successful token acquisition, write the updated token
+       * cache back to the session. For more, see:
+       * https://github.com/AzureAD/microsoft-authentication-library-for-js/blob/dev/lib/msal-node/docs/caching.md
+       */
+      // cookieStore.set("tokenCache", msalInstance.getTokenCache().serialize());
+      // cookieStore.set("accessToken", tokenResponse.accessToken);
+      // cookieStore.set("idToken", tokenResponse.idToken);
+      // cookieStore.set("account", tokenResponse.account);
+
+      await createSession({
+        tokenCache: msalInstance.getTokenCache().serialize(),
+        idToken: tokenResponse.idToken,
+        homeAccountId: tokenResponse.account?.homeAccountId ?? "",
+        accessToken: tokenResponse.accessToken,
+      });
+
+      // req.session.tokenCache = msalInstance.getTokenCache().serialize();
+      // req.session.accessToken = tokenResponse.accessToken;
+      // req.session.idToken = tokenResponse.idToken;
+      // req.session.account = tokenResponse.account;
+
+      return redirect(options.successRedirect);
+    } catch (error) {
+      if (error instanceof InteractionRequiredAuthError) {
+        return this.login({
+          scopes: options.scopes || [],
+          redirectUri: options.redirectUri,
+          successRedirect: options.successRedirect || "/",
+        });
+      }
+      console.error(error);
+      // NextResponse.next(error);
+    }
+  }
+
+  async handleRedirect(
+    request: NextRequest,
+    options: { scopes: string[]; redirectUri: string },
+  ) {
+    const textBody = await request.text();
+    const params = new URLSearchParams(textBody);
+    const reqState = params.get("state");
+    const code = params.get("code");
+
+    if (reqState === null) {
+      return NextResponse.json(
+        // TODO: エラーメッセージの改良
+        { error: "Error: state not found" },
+        { status: 500 },
+      );
+    }
+
+    if (typeof code !== "string") {
+      return NextResponse.json(
+        // TODO: エラーメッセージの改良
+        { error: "Error: code not found" },
+        { status: 500 },
+      );
+    }
+
+    const cookieStore = await cookies();
+    const verifier = cookieStore.get("verifier")?.value;
+
+    const authCodeRequest: AuthorizationCodeRequest = {
+      state: reqState,
+      /**
+       * By default, MSAL Node will add OIDC scopes to the auth code url request. For more information, visit:
+       * https://docs.microsoft.com/azure/active-directory/develop/v2-permissions-and-consent#openid-connect-scopes
+       */
+      scopes: options.scopes || [],
+      redirectUri: options.redirectUri,
+      code,
+      codeVerifier: verifier,
+    };
+
+    let state;
+    try {
+      const msalInstance = this.getMsalInstance(this.msalConfig);
+
+      const cachedState = cookieStore.get("state")?.value;
+      const authCodePayload: AuthorizationCodePayload = {
+        code,
+        state: cachedState,
+      };
+
+      const tokenResponse = await msalInstance.acquireTokenByCode(
+        authCodeRequest,
+        authCodePayload,
+      );
+
+      // req.session.tokenCache = msalInstance.getTokenCache().serialize();
+      // req.session.idToken = tokenResponse.idToken;
+      // req.session.account = tokenResponse.account;
+      // req.session.isAuthenticated = true;
+      // cookieStore.set("tokenCache", msalInstance.getTokenCache().serialize());
+      // cookieStore.set("idToken", tokenResponse.idToken);
+      // cookieStore.set("account", tokenResponse.account);
+
+      await createSession({
+        idToken: tokenResponse.idToken,
+        homeAccountId: tokenResponse.account?.homeAccountId ?? "",
+      });
+
+      state = JSON.parse(this.cryptoProvider.base64Decode(reqState));
+    } catch (error) {
+      console.log(error);
+    }
+
+    redirect(state.successRedirect);
+  }
+
+  async logout(postLogoutRedirectUri?: string) {
+    const cookieStore = await cookies();
+
+    /**
+     * Construct a logout URI and redirect the user to end the
+     * session with Azure AD. For more information, visit:
+     * https://docs.microsoft.com/azure/active-directory/develop/v2-protocols-oidc#send-a-sign-out-request
+     */
+    let logoutUri = `${this.msalConfig.auth.authority}/oauth2/v2.0/`;
+
+    if (postLogoutRedirectUri) {
+      logoutUri += `logout?post_logout_redirect_uri=${postLogoutRedirectUri}`;
+    }
+
+    cookieStore.delete("tokenCache");
+    cookieStore.delete("idToken");
+    cookieStore.delete("account");
+    cookieStore.delete("verifier");
+
+    NextResponse.redirect(logoutUri);
+  }
+
+  /**
+   * Instantiates a new MSAL ConfidentialClientApplication object
+   * @param msalConfig: MSAL Node Configuration object
+   */
+  getMsalInstance(msalConfig: Configuration): ConfidentialClientApplication {
+    return new ConfidentialClientApplication(msalConfig);
+  }
+
+  /**
+   * Prepares the auth code request parameters and initiates the first leg of auth code flow
+   * @param authCodeUrlRequestParams: parameters for requesting an auth code url
+   * @param authCodeRequestParams: parameters for requesting tokens using auth code
+   */
+  async redirectToAuthCodeUrl(
+    authCodeUrlRequestParams: AuthorizationUrlRequest,
+    msalInstance: ConfidentialClientApplication,
+  ) {
+    // Generate PKCE Codes before starting the authorization flow
+    const { verifier, challenge } =
+      await this.cryptoProvider.generatePkceCodes();
+
+    // Set generated PKCE codes
+    const cookieStore = await cookies();
+    /*
+     * PKCE は主に Public Client で使用される技術だが Confidential Client でも使用されることが推奨されている
+     * https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics#section-2.1.1-2.2
+     */
+    cookieStore.set("verifier", verifier);
+    if (authCodeUrlRequestParams.state) {
+      /*
+       * PKCE を使用する場合は state を使用しないことも許されている
+       * しかし PKCE の実装を間違えたときのための追加の保険やアプリケーション状態を運搬するために
+       * state も併用することがあるらしい
+       * https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics-13#section-3.1
+       */
+      cookieStore.set("state", authCodeUrlRequestParams.state);
+    }
+    cookieStore.set("redirectUri", authCodeUrlRequestParams.redirectUri);
+    cookieStore.set("scopes", JSON.stringify(authCodeUrlRequestParams.scopes));
+
+    const authCodeUrlRequest: AuthorizationUrlRequest = {
+      ...authCodeUrlRequestParams,
+      responseMode: ResponseMode.FORM_POST,
+      codeChallenge: challenge,
+      codeChallengeMethod: "S256",
+    };
+
+    let authCodeUrlResponse: string | null = null;
+
+    try {
+      authCodeUrlResponse =
+        await msalInstance.getAuthCodeUrl(authCodeUrlRequest);
+    } catch (error) {
+      // TODO: エラーが発生した際のログの取り方の改良
+      console.error(error);
+    }
+
+    if (authCodeUrlResponse !== null) {
+      redirect(authCodeUrlResponse);
+    } else {
+      return NextResponse.json(
+        { error: "Failed to get Authorization Code Url" },
+        { status: 500 },
+      );
+    }
+  }
+
+  /**
+   * Retrieves cloud discovery metadata from the /discovery/instance endpoint
+   */
+  async getCloudDiscoveryMetadata(
+    authority: string = `https://login.microsoftonline.com/${TENANT_ID}`,
+  ) {
+    const endpoint =
+      "https://login.microsoftonline.com/common/discovery/instance";
+
+    try {
+      const url = new URL(endpoint);
+      url.search = new URLSearchParams({
+        "api-version": "1.1",
+        authorization_endpoint: `${authority}/oauth2/v2.0/authorize`,
+      }).toString();
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  /**
+   * Retrieves oidc metadata from the openid endpoint
+   */
+  async getAuthorityMetadata(
+    authority: string = `https://login.microsoftonline.com/${TENANT_ID}`,
+  ) {
+    const endpoint = `${authority}/v2.0/.well-known/openid-configuration`;
+
+    try {
+      const response = await fetch(endpoint);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.log(error);
+    }
+  }
+}
+
+export const authProvider = new AuthProvider(msalConfig);
