@@ -69,7 +69,6 @@ class AuthProvider {
 
   async login(options: {
     successRedirect: string;
-    redirectUri: string;
     scopes: string[];
     extraScopesToConsent?: string[];
   }) {
@@ -92,7 +91,7 @@ class AuthProvider {
        */
       scopes: options.scopes,
       extraScopesToConsent: options.extraScopesToConsent,
-      redirectUri: options.redirectUri,
+      redirectUri: REDIRECT_URI,
     };
 
     /**
@@ -163,7 +162,6 @@ class AuthProvider {
       if (error instanceof InteractionRequiredAuthError) {
         await this.login({
           scopes: options.scopes,
-          redirectUri: REDIRECT_URI,
           successRedirect: options.successRedirect,
         });
       }
