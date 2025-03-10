@@ -14,6 +14,7 @@ openssl rand -base64 32
 ```
 
 Third, uncomment `REDIRECT_URI` or change it when you change a directory structure of `/api/auth/callback/microsoft-entra-id`.
+Fourth, set redirect URIs for your app in entra portal with for example `http://localhost:3000/api/auth/callback/microsoft-entra-id`.
 
 Then run the development server:
 
