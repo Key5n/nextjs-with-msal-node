@@ -21,7 +21,7 @@ export async function decrypt(session: string | undefined = "") {
     });
     return payload;
   } catch (error) {
-    console.log("Failed to verify session");
+    console.error(error);
   }
 }
 
@@ -29,12 +29,6 @@ export async function createSession(homeAccountId: string) {
   const session = await encrypt({ homeAccountId });
   const cookieStore = await cookies();
 
-  // cookieStore.set("session", session, {
-  //   httpOnly: true,
-  //   secure: true,
-  //   sameSite: "lax",
-  //   path: "/",
-  // });
   cookieStore.set("session", session);
 }
 
@@ -43,13 +37,16 @@ export async function deleteSession() {
   cookieStore.delete("session");
 }
 
-export const verifySession = cache(async () => {
+export const verifySession: () => Promise<{
+  isAuth: boolean;
+  homeAccountId: string;
+}> = cache(async () => {
   const cookie = (await cookies()).get("session")?.value;
   const data = await decrypt(cookie);
 
-  if (!data?.homeAccountId) {
+  if (!data?.homeAccountId || typeof data?.homeAccountId !== "string") {
     redirect("/api/auth/signin");
   }
 
-  return { isAuth: true, ...data };
+  return { isAuth: true, homeAccountId: data.homeAccountId };
 });

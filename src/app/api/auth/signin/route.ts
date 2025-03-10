@@ -1,13 +1,11 @@
-import { NextRequest } from "next/server";
-import { authProvider, CLIENT_ID } from "@/auth";
+import { authProvider } from "@/lib/auth";
+import { CLIENT_ID, REDIRECT_URI } from "@/lib/env";
 
-export async function GET(request: NextRequest) {
-  const redirectUri = process.env.REDIRECT_URI || request.nextUrl.origin;
-
+export async function GET() {
   await authProvider.login({
     successRedirect: "/",
-    redirectUri: redirectUri,
-    scopes: [],
+    redirectUri: REDIRECT_URI,
+    scopes: ["User.Read"],
     extraScopesToConsent: [`api://${CLIENT_ID}/Access`],
   });
 }

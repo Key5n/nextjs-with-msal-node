@@ -7,45 +7,22 @@ import {
   type AuthorizationCodeRequest,
   type AuthorizationCodePayload,
   InteractionRequiredAuthError,
-  ICachePlugin,
-  TokenCacheContext,
+  type ICachePlugin,
+  type TokenCacheContext,
 } from "@azure/msal-node";
-import fs from "fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { NextRequest, NextResponse } from "next/server";
-import { createSession, verifySession } from "./lib/session";
+import { createSession } from "./session";
 import path from "node:path";
-
-export const CLIENT_ID = process.env.CLIENT_ID;
-export const CLIENT_SECRET = process.env.CLIENT_SECRET;
-export const TENANT_ID = process.env.TENANT_ID;
-
-const REDIRECT_URI = process.env.REDIRECT_URI;
-const POST_LOGOUT_REDIRECT_URI = process.env.POST_LOGOUT_REDIRECT_URI;
-const GRAPH_ME_ENDPOINT = process.env.GRAPH_API_ENDPOINT + "v1.0/me";
-
-const CLOUD_INSTANCE = process.env.CLOUD_INSTANCE;
-
-if (!CLIENT_ID) {
-  throw new Error("CLIENT_ID is undefined");
-}
-
-if (!TENANT_ID) {
-  throw new Error("TENANT_ID is undefined");
-}
-
-if (!CLIENT_SECRET) {
-  throw new Error("CLIENT_SECRET is undefined");
-}
-
-if (!CLOUD_INSTANCE) {
-  throw new Error("CLOUD_INSTANCE is undefined");
-}
-
-if (!CLIENT_ID) {
-  throw new Error("CLIENT_ID is undefined");
-}
+import {
+  CLIENT_ID,
+  CLIENT_SECRET,
+  CLOUD_INSTANCE,
+  REDIRECT_URI,
+  TENANT_ID,
+} from "./env";
 
 const cachePath = path.join("./token-cache.json");
 
@@ -53,8 +30,8 @@ class DiskCachePlugin implements ICachePlugin {
   public async beforeCacheAccess(
     cacheContext: TokenCacheContext,
   ): Promise<void> {
-    if (fs.existsSync(cachePath)) {
-      const cacheData = fs.readFileSync(cachePath, "utf8");
+    if (existsSync(cachePath)) {
+      const cacheData = readFileSync(cachePath, "utf8");
       cacheContext.tokenCache.deserialize(cacheData); // deserialize it to in-memory cache
     }
   }
@@ -63,7 +40,7 @@ class DiskCachePlugin implements ICachePlugin {
     cacheContext: TokenCacheContext,
   ): Promise<void> {
     if (cacheContext.cacheHasChanged) {
-      fs.writeFileSync(cachePath, cacheContext.tokenCache.serialize()); // deserialize in-memory cache to persistence
+      writeFileSync(cachePath, cacheContext.tokenCache.serialize()); // deserialize in-memory cache to persistence
     }
   }
 }
@@ -103,7 +80,7 @@ class AuthProvider {
      */
     const state = this.cryptoProvider.base64Encode(
       JSON.stringify({
-        successRedirect: options.successRedirect || "/",
+        successRedirect: options.successRedirect,
       }),
     );
 
@@ -147,33 +124,30 @@ class AuthProvider {
   }
 
   async acquireToken(options: {
+    homeAccountId: string;
     scopes: string[];
     successRedirect: string;
-    redirectUri: string;
-  }) {
+  }): Promise<string> {
     try {
-      const session = await verifySession();
-      if (!session) return null;
-
       /**
        * If a token cache exists in the session, deserialize it and set it as the
        * cache for the new MSAL CCA instance. For more, see:
        * https://github.com/AzureAD/microsoft-authentication-library-for-js/blob/dev/lib/msal-node/docs/caching.md
        */
       const msalInstance = this.cca;
-      const homeAccountId = session.homeAccountId;
+      const homeAccountId = options.homeAccountId;
 
       const msalTokenCache = msalInstance.getTokenCache();
-      console.log("cache", msalTokenCache);
       const account = await msalTokenCache.getAccountByHomeId(homeAccountId);
 
       if (account === null) {
+        // TODO: Proper error handling
         throw new Error("Account not found");
       }
 
       const tokenResponse = await msalInstance.acquireTokenSilent({
         account: account,
-        scopes: options.scopes || [],
+        scopes: options.scopes,
       });
 
       /**
@@ -181,20 +155,20 @@ class AuthProvider {
        * cache back to the session. For more, see:
        * https://github.com/AzureAD/microsoft-authentication-library-for-js/blob/dev/lib/msal-node/docs/caching.md
        */
+      // if (tokenResponse.account?.homeAccountId)
+      //   await createSession(tokenResponse.account?.homeAccountId);
 
-      if (tokenResponse.account?.homeAccountId)
-        await createSession(tokenResponse.account?.homeAccountId);
+      return tokenResponse.accessToken;
     } catch (error) {
       if (error instanceof InteractionRequiredAuthError) {
         await this.login({
-          scopes: options.scopes || [],
-          redirectUri: options.redirectUri,
-          successRedirect: options.successRedirect || "/",
+          scopes: options.scopes,
+          redirectUri: REDIRECT_URI,
+          successRedirect: options.successRedirect,
         });
       }
-      console.error(error);
+      throw error;
     }
-    redirect(options.successRedirect);
   }
 
   async handleRedirect(
@@ -208,7 +182,7 @@ class AuthProvider {
 
     if (reqState === null) {
       return NextResponse.json(
-        // TODO: エラーメッセージの改良
+        // TODO: improve error handling
         { error: "Error: state not found" },
         { status: 500 },
       );
@@ -216,7 +190,7 @@ class AuthProvider {
 
     if (typeof code !== "string") {
       return NextResponse.json(
-        // TODO: エラーメッセージの改良
+        // TODO: improve error handling
         { error: "Error: code not found" },
         { status: 500 },
       );
@@ -237,7 +211,7 @@ class AuthProvider {
       codeVerifier: verifier,
     };
 
-    let state;
+    let state: { successRedirect: string } | null = null;
     try {
       const msalInstance = this.cca;
 
@@ -258,10 +232,13 @@ class AuthProvider {
 
       state = JSON.parse(this.cryptoProvider.base64Decode(reqState));
     } catch (error) {
+      // TODO: improve error handling
       console.log(error);
     }
 
-    redirect(state.successRedirect);
+    if (state !== null) {
+      redirect(state.successRedirect);
+    }
   }
 
   async logout(postLogoutRedirectUri?: string) {
@@ -328,7 +305,7 @@ class AuthProvider {
       authCodeUrlResponse =
         await msalInstance.getAuthCodeUrl(authCodeUrlRequest);
     } catch (error) {
-      // TODO: エラーが発生した際のログの取り方の改良
+      // TODO: improve error handling
       console.error(error);
     }
 

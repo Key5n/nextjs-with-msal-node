@@ -24,8 +24,6 @@ export default async function middleware(request: NextRequest) {
   const decryptedSession = session ? await decrypt(session) : undefined;
   const authorized = !!decryptedSession?.homeAccountId;
 
-  console.log("authorized", authorized);
-
   if (!authorized && request.nextUrl.pathname !== signInPage) {
     return NextResponse.redirect(new URL(signInPage, request.nextUrl));
   }

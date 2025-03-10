@@ -1,11 +1,10 @@
 import { NextRequest } from "next/server";
-import { authProvider } from "@/auth";
+import { authProvider } from "@/lib/auth";
+import { REDIRECT_URI } from "@/lib/env";
 
 export async function POST(request: NextRequest) {
-  const redirectUri = process.env.REDIRECT_URI || request.nextUrl.origin;
-
   await authProvider.handleRedirect(request, {
-    scopes: [],
-    redirectUri: redirectUri,
+    scopes: ["User.Read"],
+    redirectUri: REDIRECT_URI,
   });
 }
